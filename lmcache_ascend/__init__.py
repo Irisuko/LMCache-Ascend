@@ -247,15 +247,25 @@ def _patch_config():
         namespace_extras=namespace_extras,
     )
 
-    # If lmcache.integration.vllm.utils was already imported before this
-    # patch ran, its module-level ``LMCacheEngineConfig`` still points to
-    # the OLD class whose ``_from_file`` closure now iterates the mutated
-    # _CONFIG_DEFINITIONS dict (with keys like ``p2p_use_npu``), while the
-    # OLD ``__init__`` doesn't accept them → TypeError.  Fix by updating
-    # the stale reference.
-    _utils_mod = sys.modules.get("lmcache.integration.vllm.utils")
-    if _utils_mod is not None:
-        _utils_mod.LMCacheEngineConfig = lmcache.v1.config.LMCacheEngineConfig
+    _refresh_config_class_references(lmcache.v1.config.LMCacheEngineConfig)
+
+
+def _refresh_config_class_references(config_class):
+    """Refresh LMCache modules that may have imported the old dynamic class."""
+    for module_name in (
+        "lmcache.integration.vllm.utils",
+        "lmcache.integration.vllm.vllm_v1_adapter",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            module.LMCacheEngineConfig = config_class
+            config_instance = getattr(module, "_config_instance", None)
+            if config_instance is not None and not isinstance(
+                config_instance, config_class
+            ):
+                # Config may have been loaded while registering the CacheBlend
+                # model, before Ascend extends and rebuilds the dynamic class.
+                module._config_instance = None
 
 
 def _patch_ops():

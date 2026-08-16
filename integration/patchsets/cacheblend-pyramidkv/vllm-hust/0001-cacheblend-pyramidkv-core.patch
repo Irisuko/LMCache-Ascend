@@ -1,0 +1,387 @@
+diff --git a/tests/v1/core/test_kv_cache_compression.py b/tests/v1/core/test_kv_cache_compression.py
+index 51a502739..efe6caaae 100644
+--- a/tests/v1/core/test_kv_cache_compression.py
++++ b/tests/v1/core/test_kv_cache_compression.py
+@@ -503,6 +503,32 @@ def test_plan_commit_reclaims_tail_and_decode_uses_physical_length() -> None:
+     assert manager.block_pool.get_num_free_blocks() == 7
+ 
+ 
++def test_plan_commit_accepts_private_blocks_allocated_for_external_hits() -> None:
++    manager = _manager(compression_config=_config())
++    request = _running_request()
++    computed, num_local_tokens = manager.get_computed_blocks(request)
++    assert num_local_tokens == 0
++
++    external_tokens = 256
++    blocks = manager.allocate_slots(
++        request,
++        num_new_tokens=request.num_prompt_tokens - external_tokens,
++        num_new_computed_tokens=num_local_tokens,
++        new_computed_blocks=computed,
++        num_external_computed_tokens=external_tokens,
++        has_scheduled_reqs=False,
++    )
++    assert blocks is not None
++    request.num_computed_tokens = request.num_prompt_tokens
++    block_ids = tuple(manager.get_block_ids(request.request_id)[0])
++
++    commit = manager.apply_compression_plan(request, _plan(request, block_ids))
++
++    assert commit.released_block_ids == (block_ids[-1],)
++    assert manager.get_block_ids(request.request_id) == ([*block_ids[:2]],)
++    manager.free(request)
++
++
+ def test_prefix_cache_commit_swaps_to_private_unhashed_destination() -> None:
+     manager = _manager(enable_caching=True, compression_config=_config())
+     request = _running_request()
+@@ -582,6 +608,43 @@ def test_recompute_window_clamps_short_prompt_cache_admission() -> None:
+     assert computed.get_block_ids() == ([],)
+ 
+ 
++@pytest.mark.parametrize(
++    ("prompt_len", "local_hits", "external_hits", "expected_external_hits"),
++    [
++        (4096, 0, 4095, 4095),
++        (4097, 0, 4096, 3968),
++        (7168, 0, 7167, 7040),
++        (7168, 0, 7037, 6912),
++        (7168, 128, 7040, 6912),
++        (7168, 7040, 128, 0),
++    ],
++)
++def test_external_hits_share_aligned_compression_recompute_limit(
++    prompt_len: int,
++    local_hits: int,
++    external_hits: int,
++    expected_external_hits: int,
++) -> None:
++    manager = _manager(
++        compression_config=_config(),
++        compression_threshold_tokens=4096,
++        required_recompute_tokens=8,
++    )
++    request = _running_request(prompt_len=prompt_len)
++
++    limited_external_hits = manager.limit_compression_external_cache_hits(
++        request,
++        local_hits,
++        external_hits,
++    )
++
++    assert limited_external_hits == expected_external_hits
++    if prompt_len > 4096:
++        total_hits = local_hits + limited_external_hits
++        assert total_hits <= prompt_len - 8
++        assert total_hits % 128 == 0
++
++
+ def test_prefix_plan_requires_live_private_destination() -> None:
+     manager = _manager(enable_caching=True, compression_config=_config())
+     request = _running_request()
+@@ -707,6 +770,7 @@ def test_commit_ack_is_not_visible_until_plan_commit_and_next_schedule() -> None
+     plan = _plan(request, (0, 1, 2))
+     scheduler = SimpleNamespace(
+         _pending_kv_cache_compression_block_table_updates=set(),
++        _pending_kv_cache_compression_commit_events={},
+         _inflight_kv_cache_compression_transactions={request.request_id: 1},
+         requests={request.request_id: request},
+         kv_cache_manager=SimpleNamespace(
+@@ -865,6 +929,7 @@ def test_scheduler_commits_plans_and_rejects_them_when_disabled() -> None:
+     )
+     scheduler = SimpleNamespace(
+         _pending_kv_cache_compression_block_table_updates=set(),
++        _pending_kv_cache_compression_commit_events={},
+         _inflight_kv_cache_compression_transactions={request.request_id: 1},
+         requests={request.request_id: request},
+         kv_cache_manager=SimpleNamespace(
+@@ -1047,6 +1112,13 @@ def test_async_scheduler_fences_final_prefill_until_commit_ack(
+     assert first_decode_output.kv_cache_compression_block_table_updates == {
+         request.request_id: scheduler.kv_cache_manager.get_block_ids(request.request_id)
+     }
++    assert first_decode_output.kv_cache_compression_commit_events is not None
++    commit_event = first_decode_output.kv_cache_compression_commit_events[0]
++    assert commit_event.request_id == request.request_id
++    assert commit_event.transaction_id == 1
++    assert commit_event.semantic_tokens == 384
++    assert commit_event.physical_tokens == 192
++    assert commit_event.released_block_ids
+     next_output = scheduler.schedule()
+     assert next_output.kv_cache_compression_block_table_updates is None
+ 
+@@ -1180,3 +1252,4 @@ def test_output_contracts_are_none_on_default_path() -> None:
+         SchedulerOutput.make_empty().kv_cache_compression_destination_block_ids is None
+     )
+     assert SchedulerOutput.make_empty().kv_cache_compression_transaction_ids is None
++    assert SchedulerOutput.make_empty().kv_cache_compression_commit_events is None
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 789b90bf6..ec6d23532 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import itertools
++import math
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import Literal, overload
+@@ -293,6 +294,43 @@ class KVCacheManager:
+             and request.num_prompt_tokens > runtime_spec.compression_threshold_tokens
+         )
+ 
++    def get_compression_cache_hit_limit(self, request: Request) -> int | None:
++        """Return the aligned total cache-hit limit for compression prefill."""
++        runtime_spec = self.kv_cache_compression_runtime_spec
++        if runtime_spec is None or not self.request_requires_compression(request):
++            return None
++        max_cached_tokens = max(
++            0,
++            request.num_prompt_tokens - runtime_spec.required_recompute_tokens,
++        )
++        block_size = self._kv_cache_compression_block_size
++        return max_cached_tokens // block_size * block_size
++
++    def limit_compression_external_cache_hits(
++        self,
++        request: Request,
++        num_local_cached_tokens: int,
++        num_external_cached_tokens: int,
++    ) -> int:
++        """Cap connector hits so local and external hits share one limit."""
++        cache_hit_limit = self.get_compression_cache_hit_limit(request)
++        if cache_hit_limit is None:
++            return num_external_cached_tokens
++        if num_local_cached_tokens > cache_hit_limit:
++            raise KVCacheCompressionError(
++                "local cache hits exceed the compression recompute limit: "
++                f"request={request.request_id!r}, local={num_local_cached_tokens}, "
++                f"limit={cache_hit_limit}"
++            )
++        capped_external_tokens = min(
++            num_external_cached_tokens,
++            cache_hit_limit - num_local_cached_tokens,
++        )
++        block_size = self._kv_cache_compression_block_size
++        total_cached_tokens = num_local_cached_tokens + capped_external_tokens
++        aligned_total_cached_tokens = total_cached_tokens // block_size * block_size
++        return aligned_total_cached_tokens - num_local_cached_tokens
++
+     def get_num_compression_destination_blocks(self, request: Request) -> int:
+         """Return the private target reservation for one compressed request."""
+         runtime_spec = self.kv_cache_compression_runtime_spec
+@@ -423,6 +461,10 @@ class KVCacheManager:
+                 f"{plan.physical_num_tokens} for semantic length "
+                 f"{plan.semantic_num_tokens}"
+             )
++        if not math.isfinite(plan.compression_ms) or plan.compression_ms < 0:
++            raise KVCacheCompressionError(
++                f"compression plan has invalid compression_ms {plan.compression_ms!r}"
++            )
+         runtime_spec = self.kv_cache_compression_runtime_spec
+         if runtime_spec is None:
+             raise KVCacheCompressionError(
+@@ -567,15 +609,12 @@ class KVCacheManager:
+         # num_computed_tokens to be block-size aligned. Removing this limitation
+         # could slightly improve performance in the future.
+         max_cache_hit_length = request.num_tokens - 1
+-        runtime_spec = self.kv_cache_compression_runtime_spec
+-        if runtime_spec is not None and self.request_requires_compression(request):
+-            # The provider needs this query suffix to run in the final prefill.
+-            max_cache_hit_length = max(
+-                0,
+-                min(
+-                    max_cache_hit_length,
+-                    request.num_prompt_tokens - runtime_spec.required_recompute_tokens,
+-                ),
++        compression_cache_hit_limit = self.get_compression_cache_hit_limit(request)
++        if compression_cache_hit_limit is not None:
++            # The provider needs this aligned query suffix in the final prefill.
++            max_cache_hit_length = min(
++                max_cache_hit_length,
++                compression_cache_hit_limit,
+             )
+         computed_blocks, num_new_computed_tokens = (
+             self.coordinator.find_longest_cache_hit(
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index ab08a12db..2dac78f51 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -16,6 +16,7 @@ if TYPE_CHECKING:
+     from vllm.multimodal.inputs import MultiModalFeatureSpec
+     from vllm.pooling_params import PoolingParams
+     from vllm.sampling_params import SamplingParams
++    from vllm.v1.kv_cache_compression import KVCacheCompressionCommitEvent
+     from vllm.v1.request import Request
+ else:
+     ECConnectorMetadata = object
+@@ -251,6 +252,11 @@ class SchedulerOutput:
+     # changing the provider-facing compression-plan schema.
+     kv_cache_compression_transaction_ids: dict[str, int] | None = None
+ 
++    # Committed compression evidence delivered with the block-table ACK.
++    kv_cache_compression_commit_events: list["KVCacheCompressionCommitEvent"] | None = (
++        None
++    )
++
+     # Block IDs freshly allocated from the pool during this scheduling step.
+     # The worker zeros the corresponding GPU memory before the blocks are used,
+     # preventing stale NaN/data from corrupting attention or SSM computation.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 6727c36e7..8ce7c3eaf 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import json
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -61,6 +62,7 @@ from vllm.v1.core.sched.victim_selector import (
+ )
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.kv_cache_compression import (
++    KVCacheCompressionCommitEvent,
+     KVCacheCompressionError,
+     KVCacheCompressionRuntimeSpec,
+ )
+@@ -302,6 +304,9 @@ class Scheduler(SchedulerInterface):
+         self._pending_kv_cache_compression_block_table_updates: set[str] | None = (
+             set() if vllm_config.kv_cache_compression_config is not None else None
+         )
++        self._pending_kv_cache_compression_commit_events: (
++            dict[str, KVCacheCompressionCommitEvent] | None
++        ) = {} if vllm_config.kv_cache_compression_config is not None else None
+         prefix_cache_snapshot = (
+             self.kv_cache_manager.get_prefix_cache_snapshot(
+                 node_id="",
+@@ -856,6 +861,14 @@ class Scheduler(SchedulerInterface):
+ 
+                         num_external_computed_tokens = ext_tokens
+ 
++                        num_external_computed_tokens = (
++                            self.kv_cache_manager.limit_compression_external_cache_hits(
++                                request,
++                                num_new_local_computed_tokens,
++                                num_external_computed_tokens,
++                            )
++                        )
++
+                         connector_prefix_cache_queries = (
+                             request.num_tokens - num_new_local_computed_tokens
+                         )
+@@ -1239,6 +1252,14 @@ class Scheduler(SchedulerInterface):
+         kv_cache_compression_block_table_updates = (
+             self._take_kv_cache_compression_block_table_updates(num_scheduled_tokens)
+         )
++        kv_cache_compression_commit_events = None
++        if kv_cache_compression_block_table_updates:
++            pending_commit_events = self._pending_kv_cache_compression_commit_events
++            assert pending_commit_events is not None
++            kv_cache_compression_commit_events = [
++                pending_commit_events.pop(request_id)
++                for request_id in kv_cache_compression_block_table_updates
++            ]
+ 
+         # Record the request ids that were scheduled in this step (MRV1-only).
+         if not self.use_v2_model_runner:
+@@ -1280,6 +1301,7 @@ class Scheduler(SchedulerInterface):
+                 compression_destination_block_ids or None
+             ),
+             kv_cache_compression_transaction_ids=(compression_transaction_ids or None),
++            kv_cache_compression_commit_events=(kv_cache_compression_commit_events),
+             new_block_ids_to_zero=new_block_ids_to_zero,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+             kv_cache_usage=self.kv_cache_manager.usage,
+@@ -2217,6 +2239,36 @@ class Scheduler(SchedulerInterface):
+                     f"request {plan.request_id!r}"
+                 )
+             pending.add(plan.request_id)
++            pending_commit_events = self._pending_kv_cache_compression_commit_events
++            assert pending_commit_events is not None
++            commit_event = KVCacheCompressionCommitEvent(
++                request_id=plan.request_id,
++                transaction_id=transaction_id,
++                semantic_tokens=plan.semantic_num_tokens,
++                physical_tokens=plan.physical_num_tokens,
++                source_block_ids=commit.source_block_ids,
++                destination_block_ids=commit.destination_block_ids,
++                released_block_ids=commit.released_block_ids,
++                compression_ms=plan.compression_ms,
++            )
++            pending_commit_events[plan.request_id] = commit_event
++            logger.info(
++                "VLLM_PYRAMIDKV_EVENT %s",
++                json.dumps(
++                    {
++                        "compression_ms": commit_event.compression_ms,
++                        "destination_blocks": len(commit_event.destination_block_ids),
++                        "physical_tokens": commit_event.physical_tokens,
++                        "released_blocks": len(commit_event.released_block_ids),
++                        "request_id": commit_event.request_id,
++                        "semantic_tokens": commit_event.semantic_tokens,
++                        "source_blocks": len(commit_event.source_block_ids),
++                        "transaction_id": commit_event.transaction_id,
++                    },
++                    sort_keys=True,
++                    separators=(",", ":"),
++                ),
++            )
+             logger.info(
+                 "Committed KV cache compression plan: provider=%s request_id=%s "
+                 "transaction_id=%d "
+@@ -2522,6 +2574,10 @@ class Scheduler(SchedulerInterface):
+             self._pending_kv_cache_compression_block_table_updates.discard(
+                 request.request_id
+             )
++        if self._pending_kv_cache_compression_commit_events is not None:
++            self._pending_kv_cache_compression_commit_events.pop(
++                request.request_id, None
++            )
+         if not self.defer_block_free or (
+             # Last scheduled step already processed: no in-flight write remains
+             # (always the case for a normal finish), so free now.
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 1885c5a56..f64273fd5 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -422,11 +422,6 @@ class SingleTypeKVCacheManager(ABC):
+         """Validate a request tail truncation without changing pool state."""
+         if self.enable_caching:
+             raise ValueError("KV cache compression does not support prefix caching")
+-        if request_id in self.num_cached_block:
+-            raise ValueError(
+-                "KV cache compression cannot truncate cached request blocks"
+-            )
+-
+         blocks = self.req_to_blocks.get(request_id)
+         if blocks is None:
+             raise ValueError(f"request {request_id!r} has no allocated KV blocks")
+diff --git a/vllm/v1/kv_cache_compression.py b/vllm/v1/kv_cache_compression.py
+index 7cee6814a..06aa334a9 100644
+--- a/vllm/v1/kv_cache_compression.py
++++ b/vllm/v1/kv_cache_compression.py
+@@ -63,6 +63,21 @@ class KVCacheCompressionPlan:
+     per_layer_physical_num_tokens: tuple[tuple[str, int], ...]
+     expected_block_ids: tuple[tuple[int, ...], ...]
+     kv_cache_group_id: int = 0
++    compression_ms: float = 0.0
++
++
++@dataclass(frozen=True)
++class KVCacheCompressionCommitEvent:
++    """Scheduler-to-connector evidence for one committed compaction."""
++
++    request_id: str
++    transaction_id: int
++    semantic_tokens: int
++    physical_tokens: int
++    source_block_ids: tuple[int, ...]
++    destination_block_ids: tuple[int, ...]
++    released_block_ids: tuple[int, ...]
++    compression_ms: float
+ 
+ 
+ def ensure_kv_cache_compression_compatible(

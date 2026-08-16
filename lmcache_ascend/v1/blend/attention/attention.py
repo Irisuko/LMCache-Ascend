@@ -11,7 +11,14 @@ from torch_npu import npu_fused_infer_attention_score
 from transformers.integrations.npu_flash_attention import (
     npu_flash_attn_varlen_func as flash_attn_varlen_func,
 )
-from vllm.attention import Attention
+
+try:
+    # Third Party
+    from vllm.model_executor.layers.attention import Attention
+except ImportError:  # vLLM releases before the attention package move.
+    from vllm.attention import Attention
+
+# Third Party
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 import torch
 

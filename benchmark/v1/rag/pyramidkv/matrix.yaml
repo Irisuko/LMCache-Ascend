@@ -1,0 +1,53 @@
+schema_version: 1
+seed: 0
+modes:
+  B: {cacheblend: false, pyramidkv: false}
+  C: {cacheblend: true, pyramidkv: false}
+  P: {cacheblend: false, pyramidkv: true}
+  CP: {cacheblend: true, pyramidkv: true}
+server:
+  max_model_len: 8192
+  block_size: 128
+  max_num_seqs: 32
+  max_num_batched_tokens: 2048
+  gpu_memory_utilization: 0.8
+  chunked_prefill: true
+  async_scheduling: true
+  prefix_caching: false
+fixed_workloads:
+  boundary:
+    input_lengths: [1024, 4096, 4097]
+    output_length: 256
+    requests: 48
+    concurrency: 8
+  decode:
+    input_lengths: [7168]
+    output_length: 512
+    requests: 112
+    concurrency: [1, 8, 16, 32]
+  mixed_e2e:
+    input_lengths: [1024, 7168]
+    output_length: 32
+    requests: 16
+    concurrency: 8
+    default_enabled: false
+rag:
+  dataset: musique
+  valid_sample_start: 0
+  valid_sample_count: 200
+  supplementary_min_prompt_tokens: 4097
+  supplementary_sample_count: 14
+  output_length: 32
+  concurrency: 8
+repetitions: 3
+pyramidkv:
+  provider: pyramidkv_ascend
+  max_capacity_prompt: 512
+  min_compression_prompt_tokens: 4096
+  window_size: 8
+  kernel_size: 7
+  pooling: maxpool
+  beta: 20
+  kv_cache_granularity: kv_head
+  gqa_score_aggregation: mean
+  merge: null

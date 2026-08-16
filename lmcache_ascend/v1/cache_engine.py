@@ -1050,7 +1050,33 @@ class AscendLMCacheEngine(LMCacheEngine):
 
     def lookup_unpin(self, lookup_id: str) -> None:
         with self._engine_state_lock:
-            super().lookup_unpin(lookup_id)
+            block_mapping = self.lookup_pins.get(lookup_id)
+            if block_mapping is None:
+                super().lookup_unpin(lookup_id)
+                return
+
+            assert self.storage_manager is not None
+            self.lookup_pins.pop(lookup_id)
+            for location, keys in block_mapping.items():
+                backend = self.storage_manager.storage_backends.get(location)
+                hot_cache = getattr(backend, "hot_cache", None)
+                backend_lock = getattr(backend, "cpu_lock", None)
+                if hot_cache is None or backend_lock is None:
+                    self.storage_manager.batched_unpin(keys, [location])
+                    continue
+
+                # LMCache 0.4.4 layerwise retrieval releases the lookup pin
+                # while synchronizing its retrieved MemoryObjs but leaves the
+                # lookup mapping behind. Only release pins that are still live.
+                with backend_lock:
+                    pinned_keys = [
+                        key
+                        for key in keys
+                        if (memory_obj := hot_cache.get(key)) is not None
+                        and memory_obj.is_pinned
+                    ]
+                if pinned_keys:
+                    self.storage_manager.batched_unpin(pinned_keys, [location])
 
     @torch.inference_mode()
     def store(

@@ -43,6 +43,90 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._late_finished_sending: set[str] = set()
         logger.debug("store_async: %s", self.store_async)
 
+    def update_state_after_alloc(self, request, num_external_tokens: int):
+        """Keep CacheBlend loads on segment boundaries after scheduler capping."""
+        load_spec = self.load_specs.get(request.request_id)
+        if load_spec is not None:
+            full_hit_adjustment = int(
+                load_spec.lmcache_cached_tokens == request.num_tokens
+            )
+            offered_tokens = (
+                load_spec.lmcache_cached_tokens
+                - load_spec.vllm_cached_tokens
+                - full_hit_adjustment
+            )
+            if num_external_tokens < offered_tokens:
+                logger.info(
+                    "Keeping LMCache segment-boundary load after compression cap: "
+                    "request_id=%s loaded_tokens=%d scheduled_cached_tokens=%d",
+                    request.request_id,
+                    offered_tokens,
+                    num_external_tokens,
+                )
+                # CacheBlend hits end at segment separators, while PyramidKV
+                # starts from a block-aligned scheduler offset. Loading the
+                # whole hit is safe because vLLM allocated the complete prompt;
+                # the aligned final prefill overwrites the over-fetched tail.
+                num_external_tokens = offered_tokens
+        return super().update_state_after_alloc(request, num_external_tokens)
+
+    def build_connector_meta(self, scheduler_output):
+        """Keep load metadata intact across partial chunked-prefill steps.
+
+        Upstream derives ``ReqMeta.token_ids`` from the number of tokens that
+        can be saved in the current step.  With partial chunks discarded that
+        number can be zero even though this request has an LMCache prefix to
+        load.  CacheBlend would then execute with an empty token list and no
+        layer buffer.  Expand only the load span here; ``save_spec`` remains
+        unchanged, so partial chunks are still not persisted.
+        """
+        metadata = super().build_connector_meta(scheduler_output)
+        if not isinstance(metadata, LMCacheConnectorMetadata):
+            return metadata
+
+        for request in metadata.requests:
+            load_spec = request.load_spec
+            if load_spec is None or not load_spec.can_load:
+                continue
+
+            load_tokens = load_spec.lmcache_cached_tokens
+            if len(request.token_ids) >= load_tokens:
+                continue
+            metadata_tokens = len(request.token_ids)
+
+            tracker = self._request_trackers[request.req_id]
+            if len(tracker.token_ids) < load_tokens:
+                raise RuntimeError(
+                    "LMCache load metadata is missing token ids: "
+                    f"request={request.req_id} expected={load_tokens} "
+                    f"available={len(tracker.token_ids)}"
+                )
+
+            block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
+            block_offsets = torch.arange(0, self._block_size, dtype=torch.long)
+            slot_mapping = (
+                block_offsets.reshape((1, self._block_size))
+                + block_ids.reshape((len(block_ids), 1)) * self._block_size
+            ).flatten()
+            if len(slot_mapping) < load_tokens:
+                raise RuntimeError(
+                    "LMCache load metadata is missing allocated slots: "
+                    f"request={request.req_id} expected={load_tokens} "
+                    f"available={len(slot_mapping)}"
+                )
+
+            request.token_ids = tracker.token_ids[:load_tokens]
+            request.slot_mapping = slot_mapping[:load_tokens]
+            logger.debug(
+                "Expanded partial-prefill load metadata for request %s "
+                "from %d to %d tokens",
+                request.req_id,
+                metadata_tokens,
+                load_tokens,
+            )
+
+        return metadata
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         self.current_layer = 0
@@ -135,7 +219,15 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    try:
+                        next(layerwise_storer)
+                    except StopIteration:
+                        # An earlier layerwise failure may already have closed
+                        # the generator before the forward cleanup runs.
+                        logger.warning(
+                            "Layerwise save generator already finished for request %s",
+                            request.req_id,
+                        )
                 self.lmcache_engine.lookup_unpin(request.req_id)
             self._wait_for_save_done = True
             self._replay_finished_stores_after_save()
@@ -167,7 +259,17 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 # Re-derive how many leading tokens are *already local* and, if
                 # a remote-loaded prefix is missing locally, persist it into the
                 # local backend so later hits stay local.
-                persist_remote_skip = self._local_persist_skip(request, token_ids)
+                if (
+                    getattr(
+                        request,
+                        "kv_cache_compression_transaction_id",
+                        None,
+                    )
+                    is not None
+                ):
+                    persist_remote_skip = None
+                else:
+                    persist_remote_skip = self._local_persist_skip(request, token_ids)
                 # lmcache-ascend end ----------------------------------------
 
                 if (

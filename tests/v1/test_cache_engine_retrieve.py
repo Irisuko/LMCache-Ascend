@@ -4,7 +4,8 @@
 # Standard
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
+import threading
 
 # Third Party
 import torch
@@ -69,3 +70,25 @@ def test_retrieve_loads_cache_to_gpu_in_normal_mode():
     assert torch.all(result)
     memory_obj_0.ref_count_down.assert_called_once_with()
     memory_obj_1.ref_count_down.assert_called_once_with()
+
+
+def test_lookup_unpin_skips_layerwise_pins_that_are_already_released():
+    engine = object.__new__(AscendLMCacheEngine)
+    engine._engine_state_lock = threading.RLock()
+    engine.lookup_pins = {"request": {"LocalCPUBackend": ["released", "live"]}}
+    released = SimpleNamespace(is_pinned=False)
+    live = SimpleNamespace(is_pinned=True)
+    backend = SimpleNamespace(
+        hot_cache={"released": released, "live": live},
+        cpu_lock=threading.RLock(),
+    )
+    storage_manager = SimpleNamespace(
+        storage_backends={"LocalCPUBackend": backend},
+        batched_unpin=MagicMock(),
+    )
+    engine.storage_manager = storage_manager
+
+    engine.lookup_unpin("request")
+
+    storage_manager.batched_unpin.assert_called_once_with(["live"], ["LocalCPUBackend"])
+    assert "request" not in engine.lookup_pins

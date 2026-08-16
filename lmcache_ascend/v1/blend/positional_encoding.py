@@ -231,7 +231,9 @@ def get_fused_rope(
     dummy_vllm_config = MagicMock()
     dummy_vllm_config.parallel_config.data_parallel_size = 1
     dummy_vllm_config.compilation_config.static_forward_context = False
-    dummy_attn_metadata = MagicMock()
+    dummy_attn_metadata = {
+        "lmcache_blend": MagicMock(num_actual_tokens=10),
+    }
 
     with set_forward_context(dummy_attn_metadata, dummy_vllm_config):
         forward_context = get_forward_context()

@@ -1,0 +1,51 @@
+schema_version: 1
+name: cacheblend-pyramidkv
+
+repositories:
+  lmcache_ascend:
+    url: https://github.com/Irisuko/LMCache-Ascend.git
+    base_sha: 169ee7283de1f8ce3b26149f5bc1399fc45b2373
+  vllm_hust:
+    url: https://github.com/vLLM-HUST/vllm-hust.git
+    base_sha: cd683d7f3bec0a8877c217f7e01c3812e1b98dd5
+    applied_tree_sha: 0dcfab0b172c783d01c3ef27301f6eba70f976e0
+    patches:
+      - file: vllm-hust/0001-cacheblend-pyramidkv-core.patch
+        sha256: 11aeb014480eb8b592666e8abce9655b863405057feb5980444a9f4d09e22ea2
+  vllm_ascend_hust:
+    url: https://github.com/vLLM-HUST/vllm-ascend-hust.git
+    base_sha: b0613602f502ffeb163ac5c4a6343f432880e38e
+    development_source_sha: 9b6bebb915bff0ccf8fc0a749a42594106108626
+    applied_tree_sha: eeccfbf08be523b4f4d1678508b00fdb738a3617
+    patches:
+      - file: vllm-ascend-hust/0001-pyramidkv-ascend-lmcache.patch
+        sha256: a68004e501763a83c5b90bddfe8a67c7397494afb61eb26338d39952c01e51da
+
+runtime:
+  python: 3.11
+  lmcache: 0.4.4
+  lmcache_ascend: 0.4.5.dev2
+  torch: 2.9.0
+  torch_npu: 2.9.0
+  vllm: 0.18.0
+  vllm_ascend: 0.18.0
+  cann: 9.0.0
+  device: Ascend 910B2
+  observed_torch_build: 2.9.0+cpu
+
+model:
+  path: /workspace/models/Meta-Llama-3-8B-Instruct
+  architecture: LlamaForCausalLM
+  dtype: bfloat16
+  files:
+    config.json: 61f3de03a16ca8046b05dc777bce72717022bc8522152eee61a69072272ef54b
+    configuration.json: a78221ae93dd8977b26fcd1d106fa5ad7e7f1fd3a7d93bfd9d6fba5ed00ec4d2
+    generation_config.json: d1af74d8ba49428ab2faa65f7948165cc6bf52b740e57e840f8af772587c894c
+    model-00001-of-00004.safetensors: d8cf9c4d0dd972e1a2131bfe656235ee98221679711a3beef6d46dadf0f20b5c
+    model-00002-of-00004.safetensors: 8d4782b4a69ef03845159ce1a15e272aadaaf134dc138d68f616098e8531729c
+    model-00003-of-00004.safetensors: 3acdd690e65c24f42a24581b8467af98bd3ca357444580f8012aacd2bd607921
+    model-00004-of-00004.safetensors: 67e9ad31c8c32abf3a55ee7fc7217b3ecb35fd3c74d98a5bd233e0e4d6964f46
+    model.safetensors.index.json: 146776fce3f6db1103aa6f249e65ee5544c5923ce6f971b092eee79aa6e5d37b
+    special_tokens_map.json: 462d91939dbc37178aa5a3eae7068d1990ccc92e09f288cc71f42cdf139d69cc
+    tokenizer.json: e134af98b985517b4f068e3755ae90d4e9cd2d45d328325dc503f1c6b2d06cc7
+    tokenizer_config.json: da0e3a7cce6e4d787e85eb1c24d548420e0d7fe2c7a214e192795c46e40d75bb

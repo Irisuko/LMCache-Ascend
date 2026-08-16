@@ -10,12 +10,25 @@ from lmcache_ascend.v1.blend.attention.attention import LMCFlashAttnMetadata
 from lmcache_ascend.v1.blend.models.models import LMCModel
 
 
+def _embed_input_ids(vllm_model, input_ids: torch.Tensor) -> torch.Tensor:
+    """Call the input embedding API exposed by the active vLLM version."""
+    for model in (vllm_model, getattr(vllm_model, "model", None)):
+        if model is None:
+            continue
+        embed = getattr(model, "embed_input_ids", None)
+        if embed is None:
+            embed = getattr(model, "get_input_embeddings", None)
+        if embed is not None:
+            return embed(input_ids)
+    raise AttributeError("vLLM Llama model exposes no input embedding method")
+
+
 class LMCLlamaModel(LMCModel):
     @torch.compile
     def compute_layer(
         self, input_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
     ):
-        hidden_states = self.vllm_model.get_input_embeddings(input_ids.npu())
+        hidden_states = _embed_input_ids(self.vllm_model, input_ids.npu())
         residual = None
 
         # TODO (Jiayi): reduce the number of calls

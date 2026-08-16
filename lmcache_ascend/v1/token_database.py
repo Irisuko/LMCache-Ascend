@@ -87,6 +87,11 @@ def TokenDatabase_process_tokens(
             if idx > 0:
                 start_idx += self.sep_len
                 end_idx += self.sep_len
+            # A leading, trailing, or repeated blend separator produces an
+            # empty segment. Do not create a zero-byte cache allocation for it.
+            if token_chunk_len == 0:
+                start_idx = end_idx
+                continue
             if start_idx >= num_falses:
                 if make_key:
                     yield (
